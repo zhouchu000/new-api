@@ -323,3 +323,112 @@ func TestStreamKeepAliveCancellation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, strings.HasSuffix(recorder.Body.String(), "data: done\n\n"))
 }
+
+// upstreamAttempts is the retry loop used by Relay after a failure: RetryTimes
+// is the number of fallbacks, and a committed downstream response skips every
+// remaining upstream call.
+func upstreamAttemptsAfter429(t *testing.T, c *gin.Context, upstreamURL string, channelType int) int {
+	t.Helper()
+	apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+	const retryTimes = 1
+	attempts := 0
+	for retry := 0; retry <= retryTimes; retry++ {
+		if service.DownstreamResponseCommitted(c) || service.RelayStreamStarted(c) {
+			break
+		}
+		attempts++
+		response, err := http.Get(upstreamURL)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusTooManyRequests, response.StatusCode)
+		require.NoError(t, response.Body.Close())
+		decision := service.DecideRelayRetry(c, apiErr, retryTimes-retry)
+		if decision.Action != "retry" {
+			break
+		}
+		if _, waitErr := service.WaitBeforeRelayRetry(c, channelType, apiErr, decision); waitErr != nil {
+			break
+		}
+	}
+	return attempts
+}
+
+func TestFlushedPingBlocksAnotherUpstreamRequest(t *testing.T) {
+	var seen atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"RESOURCE_EXHAUSTED"}}`)
+	}))
+	defer upstream.Close()
+
+	t.Run("staged headers do not commit and keep one fallback", func(t *testing.T) {
+		seen.Store(0)
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		helper.SetEventStreamHeaders(c)
+		require.False(t, c.Writer.Written())
+		require.False(t, service.DownstreamResponseCommitted(c))
+		require.Equal(t, 2, upstreamAttemptsAfter429(t, c, upstream.URL, constant.ChannelTypeOpenAI))
+		require.Equal(t, int32(2), seen.Load())
+	})
+
+	t.Run("ping flush then 429 opens no upstream request", func(t *testing.T) {
+		seen.Store(0)
+		recorder := &pingFlushRecorder{ResponseRecorder: httptest.NewRecorder(), flushed: make(chan struct{})}
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		stop := helper.StartStreamKeepAlive(c, 20*time.Millisecond)
+		t.Cleanup(stop)
+		select {
+		case <-recorder.flushed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("keepalive ping was not flushed")
+		}
+		require.True(t, service.DownstreamResponseCommitted(c))
+		require.Equal(t, http.StatusOK, c.Writer.Status())
+		body := recorder.snapshot()
+		require.Contains(t, body, ": PING")
+		require.NotContains(t, body, "data:")
+		apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+		require.Equal(t, service.PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}, service.DecideRelayRetry(c, apiErr, 1))
+		require.Equal(t, 0, upstreamAttemptsAfter429(t, c, upstream.URL, constant.ChannelTypeVertexAi))
+		require.Equal(t, int32(0), seen.Load())
+	})
+}
+
+type pingFlushRecorder struct {
+	*httptest.ResponseRecorder
+	mu      sync.Mutex
+	flushed chan struct{}
+	once    sync.Once
+}
+
+func (w *pingFlushRecorder) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.ResponseRecorder.Write(p)
+	if strings.Contains(string(p), ": PING") {
+		w.once.Do(func() { close(w.flushed) })
+	}
+	return n, err
+}
+
+func (w *pingFlushRecorder) WriteHeader(code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+func (w *pingFlushRecorder) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ResponseRecorder.Flush()
+}
+
+func (w *pingFlushRecorder) snapshot() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Body.String()
+}

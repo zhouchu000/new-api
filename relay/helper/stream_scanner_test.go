@@ -763,6 +763,34 @@ func TestStreamScannerHandler_ThoughtAndUsageDataAreProgress(t *testing.T) {
 	assert.Contains(t, got[1], `"usageMetadata"`)
 }
 
+// A valid payload is a nonempty SSE data field, the same event the received=
+// counter records. Comments and empty data fields are not payloads. Arbitrary
+// nonempty data, including "{}", is a payload and is delivered; thought and
+// usage JSON are not filtered out of that set.
+func TestStreamScannerHandler_ArbitraryNonemptyDataCountsAsPayload(t *testing.T) {
+	body := ": comment\n\nevent: ping\ndata:\n" +
+		"data: {}\n" +
+		"data: ping\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"step\"}]}}]}\n" +
+		"data: {\"usageMetadata\":{\"totalTokenCount\":4}}\n" +
+		"data: [DONE]\n"
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+	info.DisablePing = true
+	var got []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, 4, info.ReceivedResponseCount)
+	require.Equal(t, []string{
+		"{}",
+		"ping",
+		`{"candidates":[{"content":{"parts":[{"thought":true,"text":"step"}]}}]}`,
+		`{"usageMetadata":{"totalTokenCount":4}}`,
+	}, got)
+}
+
 func TestStreamScannerHandler_ClientCancelDuringKeepaliveReturns(t *testing.T) {
 	oldTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30

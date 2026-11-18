@@ -175,6 +175,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		// A flushed keepalive comment commits HTTP 200 before any model payload.
+		// Do not open another upstream request after that, including the first
+		// attempt when the ping won the race with channel selection.
+		if service.DownstreamResponseCommitted(c) || service.RelayStreamStarted(c) {
+			if newAPIError == nil {
+				newAPIError = types.NewErrorWithStatusCode(errors.New("downstream response already committed"), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+			}
+			break
+		}
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0

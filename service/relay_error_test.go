@@ -365,10 +365,20 @@ func TestSkipRetryAndCancellationDoNotSleepThroughBackoff(t *testing.T) {
 	_, writeErr := keepalive.Writer.Write([]byte(": PING\n\n"))
 	require.NoError(t, writeErr)
 	require.True(t, keepalive.Writer.Written())
-	assert.Equal(t, "retry", DecideRelayRetry(keepalive, apiErr, 1).Action, "a pre-request keepalive does not commit the upstream stream")
-	openAIWait, waitErr := WaitBeforeRelayRetry(keepalive, constant.ChannelTypeOpenAI, apiErr, PolicyDecision{Action: "retry"})
-	require.NoError(t, waitErr)
-	assert.Equal(t, time.Duration(0), openAIWait)
+	require.True(t, DownstreamResponseCommitted(keepalive))
+	assert.Equal(t, PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}, DecideRelayRetry(keepalive, apiErr, 1))
+	waited, err = WaitBeforeRelayRetry(keepalive, constant.ChannelTypeGemini, apiErr, DecideRelayRetry(keepalive, apiErr, 1))
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), waited)
+
+	upgraded, _ := gin.CreateTestContext(httptest.NewRecorder())
+	upgraded.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	upgraded.Writer.WriteHeader(http.StatusSwitchingProtocols)
+	upgraded.Writer.WriteHeaderNow()
+	require.True(t, upgraded.Writer.Written())
+	require.Equal(t, http.StatusSwitchingProtocols, upgraded.Writer.Status())
+	require.False(t, DownstreamResponseCommitted(upgraded))
+	assert.Equal(t, "retry", DecideRelayRetry(upgraded, apiErr, 1).Action)
 }
 
 func TestMatchedAffinityRuleCarriesRetryBackoff(t *testing.T) {

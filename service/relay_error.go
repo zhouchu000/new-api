@@ -31,7 +31,8 @@ var (
 )
 
 // MarkRelayStreamStarted records that an upstream success stream is being
-// relayed to the client. Pre-request keepalive pings do not set it.
+// relayed. A keepalive comment does not call this; a flushed ping is still a
+// committed HTTP response and is reported by DownstreamResponseCommitted.
 func MarkRelayStreamStarted(c *gin.Context) {
 	if c == nil {
 		return
@@ -54,13 +55,25 @@ func RelayStreamStarted(c *gin.Context) bool {
 	return ok && value
 }
 
+// DownstreamResponseCommitted reports that the client has already been sent
+// an HTTP response. Header values staged for an event stream are not a
+// commit; the first Write is, including a keepalive comment and no model
+// payload. A websocket upgrade is status 101 and is not this commit, so a
+// failed dial can still use the remaining attempt budget.
+func DownstreamResponseCommitted(c *gin.Context) bool {
+	if c == nil || c.Writer == nil || !c.Writer.Written() {
+		return false
+	}
+	return c.Writer.Status() != http.StatusSwitchingProtocols
+}
+
 // DecideRelayRetry is the single retry decision for relay attempts. The reason
 // is recorded in the request policy decision events of the log details.
 func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) PolicyDecision {
 	if err == nil {
 		return PolicyDecision{Action: "stop", Reason: "request_completed", Source: "system"}
 	}
-	if RelayStreamStarted(c) {
+	if RelayStreamStarted(c) || DownstreamResponseCommitted(c) {
 		return PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}
 	}
 	if ShouldSkipRetryAfterChannelAffinityFailure(c) {

@@ -336,6 +336,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					if _, waitErr := service.WaitBeforeRelayRetry(c, channel.Type, apiErr, decision); waitErr != nil {
 						return apiErr
 					}
+					if service.DownstreamResponseCommitted(c) || service.RelayStreamStarted(c) {
+						return apiErr
+					}
 					continue
 				}
 				return apiErr
