@@ -1,16 +1,27 @@
 // Command gemini-egress-helper is an optional pass-through in front of one
-// upstream origin. It does not replace the live gateway and it does not retry.
+// upstream origin. It does not replace the live gateway.
 //
-// The gateway waits for the upstream HTTP response before it uses its own
-// retry budget. Holding a 429 here spaces that existing failover. A helper in
-// front of the gateway only sees the final 429, after that failover has
-// already happened, and a helper-level retry would issue another full set of
-// gateway attempts.
+// By default it dials that origin once. Holding a 429 here spaces the
+// gateway's existing failover. A helper in front of the gateway only sees the
+// final 429, after that failover has already happened.
+//
+// -region-failover stays off unless the operator also sets an allowlist of
+// regions (us, eu) and exact models. It may then make one extra dial after an
+// explicit HTTP 429, before any downstream byte, rewriting only the paired
+// location and host. It does not replay an HTTP 200, a committed stream, or a
+// transport failure. A non-2xx alternate response is not returned as success;
+// the client still sees the original 429. Switching region does not add quota.
+//
+// maxExtraRegionAttempts is 1. With the gateway's RetryTimes=1, two helper
+// dials times two channels is four upstream calls, plus one capped backoff on
+// each helper request that sees a 429.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -19,33 +30,59 @@ import (
 )
 
 const (
-	defaultDelay         = 2 * time.Second
-	defaultDelayCap      = 30 * time.Second
-	defaultFirstWait     = 300 * time.Second
-	defaultIdle          = 300 * time.Second
-	defaultHeaderTimeout = 2 * time.Minute
-	maxErrorBody         = 1 << 20
-	maxRequestTarget     = 8 << 10
+	defaultDelay          = 2 * time.Second
+	defaultDelayCap       = 30 * time.Second
+	defaultFirstWait      = 300 * time.Second
+	defaultIdle           = 300 * time.Second
+	defaultHeaderTimeout  = 2 * time.Minute
+	defaultRegionBody     = 1 << 20
+	maxRegionBody         = 8 << 20
+	defaultRegionDeadline = 45 * time.Second
+	maxErrorBody          = 1 << 20
+	maxRequestTarget      = 8 << 10
+	// maxExtraRegionAttempts is the whole failover budget. Do not loop the
+	// allowlist. One extra dial, then stop.
+	maxExtraRegionAttempts = 1
 )
 
+var errRejectedHost = errors.New("rejected host")
+
 // Config is the helper's behavior. Zero durations use the defaults above.
-// Upstream is the only origin requests are forwarded to.
+// Upstream is the only origin requests are forwarded to unless region
+// failover is explicitly enabled. Region targets are region codes, never hosts.
+// testRegionHosts, when non-nil, replaces the official host table. The CLI
+// does not set it. A missing code does not fall through to the official hosts.
 type Config struct {
-	Upstream      string
-	Delay         time.Duration
-	DelayCap      time.Duration
-	FirstValid    time.Duration
-	Idle          time.Duration
-	HeaderTimeout time.Duration
-	Logf          func(string, ...any)
+	Upstream         string
+	Delay            time.Duration
+	DelayCap         time.Duration
+	FirstValid       time.Duration
+	Idle             time.Duration
+	HeaderTimeout    time.Duration
+	RegionFailover   bool
+	RegionTargets    []string
+	RegionModels     []string
+	RegionBodyBudget int64
+	RegionDeadline   time.Duration
+	Logf             func(string, ...any)
+	testRegionHosts  map[string]string
 }
 
 type handler struct {
-	cfg    Config
-	client *http.Client
+	cfg      Config
+	client   *http.Client
+	upstream *urlUpstream
 }
 
-// NewHandler forwards each request to cfg.Upstream once.
+// urlUpstream is the parsed fixed origin. It is not taken from the request.
+type urlUpstream struct {
+	scheme string
+	host   string
+}
+
+// NewHandler forwards each request to cfg.Upstream once unless region
+// failover is enabled with both allowlists. An empty allowlist keeps the
+// single dial even if RegionFailover is set.
 func NewHandler(cfg Config) http.Handler {
 	if cfg.Delay <= 0 {
 		cfg.Delay = defaultDelay
@@ -65,11 +102,25 @@ func NewHandler(cfg Config) http.Handler {
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = defaultHeaderTimeout
 	}
+	if cfg.RegionBodyBudget <= 0 {
+		cfg.RegionBodyBudget = defaultRegionBody
+	}
+	if cfg.RegionBodyBudget > maxRegionBody {
+		cfg.RegionBodyBudget = maxRegionBody
+	}
+	if cfg.RegionDeadline <= 0 {
+		cfg.RegionDeadline = defaultRegionDeadline
+	}
+	if cfg.RegionFailover && (len(cfg.RegionTargets) == 0 || len(cfg.RegionModels) == 0) {
+		cfg.RegionFailover = false
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
+	parsed, _ := parseFixedOrigin(cfg.Upstream)
 	return &handler{
-		cfg: cfg,
+		cfg:      cfg,
+		upstream: parsed,
 		client: &http.Client{
 			// A stream can outlive any fixed client timeout. Header wait is
 			// bounded separately; the body is bounded by the SSE deadlines.
@@ -93,20 +144,22 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request target", http.StatusBadRequest)
 		return
 	}
-	upstreamURL := strings.TrimRight(h.cfg.Upstream, "/") + target
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
-	if err != nil {
+	if h.upstream == nil {
 		h.cfg.Logf("reject request")
 		writeFailure(w)
 		return
 	}
-	if parsed, err := http.NewRequest(http.MethodGet, h.cfg.Upstream, nil); err == nil {
-		out.Host = parsed.Host
+	path, rawQuery, _ := strings.Cut(target, "?")
+	plan := h.planRegion(r, path, rawQuery)
+	body, length, replay, err := h.prepareReplay(r, plan.eligible)
+	if err != nil {
+		h.cfg.Logf("reject request")
+		if r.Context().Err() == nil {
+			writeFailure(w)
+		}
+		return
 	}
-	out.ContentLength = r.ContentLength
-	copyHeaders(out.Header, r.Header)
-
-	resp, err := h.client.Do(out)
+	resp, err := h.roundTrip(r.Context(), r, h.upstream.scheme+"://"+h.upstream.host+target, h.upstream.host, body, length)
 	if err != nil {
 		h.cfg.Logf("upstream dial failed")
 		if r.Context().Err() == nil {
@@ -117,9 +170,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		h.finishTooMany(w, r, resp)
+		h.finishTooMany(w, r, resp, replay, plan)
 		return
 	}
+	h.writeUpstream(w, r, resp)
+}
+
+func (h *handler) writeUpstream(w http.ResponseWriter, r *http.Request, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
 	if isEventStream(resp.Header.Get("Content-Type")) {
 		// The body is copied unchanged, including CRLF, but a deadline may
@@ -134,7 +191,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isEventStream(resp.Header.Get("Content-Type")) {
 		// Status is already committed. The pump may only close this one
 		// response. It does not dial again.
-		err = pumpSSE(r.Context(), w, resp.Body, h.cfg.FirstValid, h.cfg.Idle)
+		err := pumpSSE(r.Context(), w, resp.Body, h.cfg.FirstValid, h.cfg.Idle)
 		if err != nil && r.Context().Err() == nil && err != io.EOF {
 			h.cfg.Logf("stream ended")
 		}
@@ -143,21 +200,126 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (h *handler) finishTooMany(w http.ResponseWriter, r *http.Request, resp *http.Response) {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-	wait := holdDuration(resp.Header.Get("Retry-After"), time.Now(), h.cfg.Delay, h.cfg.DelayCap)
+type saved429 struct {
+	header     http.Header
+	body       []byte
+	retryAfter string
+}
+
+func (h *handler) finishTooMany(w http.ResponseWriter, r *http.Request, resp *http.Response, replay *replayBody, plan regionPlan) {
+	saved := saved429{
+		header:     resp.Header.Clone(),
+		retryAfter: resp.Header.Get("Retry-After"),
+	}
+	saved.body, _ = io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+	if h.tryRegion(w, r, saved, replay, plan) {
+		return
+	}
+	h.writeSaved429(w, r, saved, true)
+}
+
+// tryRegion makes at most one extra dial. The hold before that dial is the
+// same capped wait the helper uses when failover is off. The original 429 is
+// not held a second time. A non-2xx alternate result is discarded; the client
+// still receives the saved 429 so a regional 403 or 404 is not presented as a
+// healthy response and the quota diagnostic is preserved.
+func (h *handler) tryRegion(w http.ResponseWriter, r *http.Request, saved saved429, replay *replayBody, plan regionPlan) bool {
+	if !plan.eligible || replay == nil || maxExtraRegionAttempts < 1 {
+		return false
+	}
+	wait := holdDuration(saved.retryAfter, time.Now(), h.cfg.Delay, h.cfg.DelayCap)
 	h.cfg.Logf("hold status=429 wait=%s", wait)
+	h.cfg.Logf("region attempt region=%s", plan.region)
+	attemptCtx, cancel := context.WithTimeout(r.Context(), h.cfg.RegionDeadline)
+	defer cancel()
+	if err := sleepContext(attemptCtx, wait); err != nil {
+		if r.Context().Err() != nil {
+			return true
+		}
+		h.cfg.Logf("region deadline")
+		h.writeSaved429(w, r, saved, false)
+		return true
+	}
+	resp, err := h.roundTrip(attemptCtx, r, plan.rawURL, plan.host, bytes.NewReader(replay.data), int64(len(replay.data)))
+	if err != nil {
+		h.cfg.Logf("region transport failed")
+		if r.Context().Err() != nil {
+			return true
+		}
+		h.writeSaved429(w, r, saved, false)
+		return true
+	}
+	defer resp.Body.Close()
+	h.cfg.Logf("region result region=%s status=%d", plan.region, resp.StatusCode)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		h.writeUpstream(w, r, resp)
+		return true
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+	h.writeSaved429(w, r, saved, false)
+	return true
+}
+
+func (h *handler) writeSaved429(w http.ResponseWriter, r *http.Request, saved saved429, hold bool) {
+	if hold {
+		wait := holdDuration(saved.retryAfter, time.Now(), h.cfg.Delay, h.cfg.DelayCap)
+		h.cfg.Logf("hold status=429 wait=%s", wait)
+		if err := sleepContext(r.Context(), wait); err != nil {
+			return
+		}
+	}
+	copyHeaders(w.Header(), saved.header)
+	w.Header().Set("Content-Length", strconv.Itoa(len(saved.body)))
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write(saved.body)
+}
+
+func sleepContext(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		return nil
+	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
-	case <-r.Context().Done():
-		return
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-timer.C:
+		return nil
 	}
-	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusTooManyRequests)
-	_, _ = w.Write(body)
+}
+
+type replayBody struct {
+	data []byte
+}
+
+// prepareReplay buffers only a request that is allowed to fail over and whose
+// size is already known to fit the budget. Anything else is streamed once.
+func (h *handler) prepareReplay(r *http.Request, eligible bool) (io.Reader, int64, *replayBody, error) {
+	if !eligible || r.ContentLength < 0 || r.ContentLength > h.cfg.RegionBodyBudget {
+		return r.Body, r.ContentLength, nil, nil
+	}
+	buf := make([]byte, r.ContentLength)
+	if _, err := io.ReadFull(r.Body, buf); err != nil {
+		return nil, 0, nil, err
+	}
+	return bytes.NewReader(buf), int64(len(buf)), &replayBody{data: buf}, nil
+}
+
+func (h *handler) roundTrip(ctx context.Context, r *http.Request, rawURL, host string, body io.Reader, length int64) (*http.Response, error) {
+	if !h.allowHost(host) {
+		return nil, errRejectedHost
+	}
+	out, err := http.NewRequestWithContext(ctx, r.Method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	// bytes.Reader would install GetBody, and the transport can then replay a
+	// POST on a recycled connection. This helper dials explicitly or not at all.
+	out.GetBody = nil
+	out.Host = host
+	out.ContentLength = length
+	copyHeaders(out.Header, r.Header)
+	return h.client.Do(out)
 }
 
 // originRequestTarget accepts only an origin-form path on this process's
