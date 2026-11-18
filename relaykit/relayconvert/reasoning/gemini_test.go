@@ -363,3 +363,55 @@ func TestNormalizeGeminiThinkingConfigRewritesNativeConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestGemini4ThinkingLevels(t *testing.T) {
+	for _, model := range []string{"gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen-cyber-permissive"} {
+		for _, tc := range []struct {
+			input Effort
+			want  string
+		}{
+			{EffortLow, "low"}, {EffortMedium, "medium"}, {EffortHigh, "high"}, {EffortMinimal, "low"}, {EffortNone, "low"},
+		} {
+			t.Run(model+"/"+string(tc.input), func(t *testing.T) {
+				got, err := RenderGemini(model, Intent{Effort: tc.input}, nil, 0)
+				require.NoError(t, err)
+				require.NotNil(t, got.Config)
+				assert.Equal(t, tc.want, got.Config.ThinkingLevel)
+				assert.Nil(t, got.Config.ThinkingBudget)
+			})
+		}
+		want := "high"
+		if model == "gemini-4-hydrogen" || model == "gemini-4-hydrogen-cyber-permissive" {
+			want = "xhigh"
+		}
+		for _, effort := range []Effort{EffortXHigh, EffortMax} {
+			got, err := RenderGemini(model, Intent{Effort: effort}, nil, 0)
+			require.NoError(t, err)
+			require.NotNil(t, got.Config)
+			assert.Equal(t, want, got.Config.ThinkingLevel)
+		}
+		generation := &dto.GeminiChatGenerationConfig{ThinkingConfig: &dto.GeminiThinkingConfig{ThinkingBudget: intPtr(8192)}}
+		_, diagnostics, err := NormalizeGeminiThinkingConfig(model, generation)
+		require.NoError(t, err)
+		assert.Nil(t, generation.ThinkingConfig.ThinkingBudget)
+		assert.Equal(t, "medium", generation.ThinkingConfig.ThinkingLevel)
+		assert.Contains(t, diagnosticCodes(diagnostics), "gemini_budget_to_level")
+		for _, tc := range []struct{ input, want string }{{"minimal", "low"}, {"none", "low"}, {"xhigh", want}, {"max", want}} {
+			generation := &dto.GeminiChatGenerationConfig{ThinkingConfig: &dto.GeminiThinkingConfig{ThinkingLevel: tc.input}}
+			_, _, err := NormalizeGeminiThinkingConfig(model, generation)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, generation.ThinkingConfig.ThinkingLevel)
+		}
+	}
+}
+
+func TestGemini4DefaultsAndUnknownFamily(t *testing.T) {
+	for model, want := range map[string]Effort{"gemini-4-hydrogen": EffortHigh, "gemini-4-carbon": EffortMedium, "gemini-4-argon": EffortMedium} {
+		assert.Equal(t, want, ResolveGeminiDefault(model, Intent{}).Effort)
+		assert.Equal(t, want, ResolveGeminiEnabledDefault(model, Intent{Mode: ModeEnabled}, nil).Effort)
+	}
+	got, err := RenderGemini("gemini-4-unknown", Intent{Effort: EffortMedium}, nil, 0)
+	require.NoError(t, err)
+	assert.Nil(t, got.Config)
+	assert.Contains(t, diagnosticCodes(got.Diagnostics), "gemini_unknown_capability")
+}

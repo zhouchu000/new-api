@@ -19,6 +19,23 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+func TestBuildRequestPolicyRetryBackoff(t *testing.T) {
+	snapshot, err := BuildRequestPolicy(map[string]string{
+		"channel_affinity_setting.rules": `[{"name":"gemini","model_regex":["gemini-.*"],"key_sources":[{"type":"gjson","path":"user"}],"retry_backoff_seconds":4,"retry_backoff_cap_seconds":12,"retry_backoff_disabled":true}]`,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, snapshot.Affinity.Rules)
+	rule := snapshot.Affinity.Rules[0]
+	assert.Equal(t, 4, rule.RetryBackoffSeconds)
+	assert.Equal(t, 12, rule.RetryBackoffCapSeconds)
+	assert.True(t, rule.RetryBackoffDisabled)
+
+	_, err = BuildRequestPolicy(map[string]string{
+		"channel_affinity_setting.rules": `[{"name":"gemini","model_regex":["gemini-.*"],"key_sources":[{"type":"gjson","path":"user"}],"retry_backoff_cap_seconds":-5}]`,
+	})
+	require.Error(t, err)
+}
+
 func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {

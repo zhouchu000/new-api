@@ -198,6 +198,9 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 		if rule.TTLSeconds < 0 {
 			return nil, fmt.Errorf("negative affinity TTL")
 		}
+		if rule.RetryBackoffSeconds < 0 || rule.RetryBackoffCapSeconds < 0 {
+			return nil, fmt.Errorf("rule %q: retry backoff must be a non-negative number of seconds", rule.Name)
+		}
 	}
 	return snapshot, nil
 }

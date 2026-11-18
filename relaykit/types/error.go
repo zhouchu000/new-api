@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 )
@@ -96,6 +97,10 @@ type NewAPIError struct {
 	errorCode      ErrorCode
 	StatusCode     int
 	Metadata       json.RawMessage
+	// retryAfter is set only when the upstream response carried a Retry-After
+	// header. A zero delay is a present hint to retry immediately.
+	retryAfter     time.Duration
+	retryAfterSeen bool
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -177,6 +182,28 @@ func (e *NewAPIError) MaskSensitiveErrorWithStatusCode(upstreamURLs ...string) s
 
 func (e *NewAPIError) SetMessage(message string) {
 	e.Err = errors.New(message)
+}
+
+// SetRetryAfter records a Retry-After hint from the upstream response.
+// Negative durations are treated as zero. The hint stays absent until this is called.
+func (e *NewAPIError) SetRetryAfter(delay time.Duration) {
+	if e == nil {
+		return
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	e.retryAfter = delay
+	e.retryAfterSeen = true
+}
+
+// RetryAfter reports the upstream Retry-After hint. The boolean is false when
+// the upstream sent no usable header.
+func (e *NewAPIError) RetryAfter() (time.Duration, bool) {
+	if e == nil || !e.retryAfterSeen {
+		return 0, false
+	}
+	return e.retryAfter, true
 }
 
 // ToOpenAIError masks the upstream addresses in the message; pass those of the

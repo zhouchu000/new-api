@@ -122,6 +122,10 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	if resp == nil || dataHandler == nil {
 		return
 	}
+	// The upstream success stream is now the response. Comments and other
+	// keepalive lines must not extend the wait for the first valid payload,
+	// and a later failure must not open a second upstream request.
+	service.MarkRelayStreamStarted(c)
 
 	// Finish the request keepalive before changing headers. The scanner owns
 	// subsequent ping and data writes through its shared write mutex.
@@ -294,7 +298,6 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
 			data := scanner.Text()
 			logger.LogDebug(c, "stream scanner data: %s", data)
 
@@ -310,8 +313,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				continue
 			}
 			if !strings.HasPrefix(data, "[DONE]") {
+				// Only a nonempty data payload is progress. SSE comments,
+				// event/id/retry fields, blank lines, and empty data fields
+				// leave both the first-valid deadline and the later idle
+				// deadline on the clock that started at the last real payload
+				// (or at scanner start, before any payload).
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
+				ticker.Reset(streamingTimeout)
 
 				select {
 				case dataChan <- data:

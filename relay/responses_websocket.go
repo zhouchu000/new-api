@@ -333,6 +333,12 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
 				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
 				if decision.Action == "retry" {
+					if _, waitErr := service.WaitBeforeRelayRetry(c, channel.Type, apiErr, decision); waitErr != nil {
+						return apiErr
+					}
+					if service.DownstreamResponseCommitted(c) || service.RelayStreamStarted(c) {
+						return apiErr
+					}
 					continue
 				}
 				return apiErr
