@@ -42,19 +42,22 @@ var (
 )
 
 type channelAffinityMeta struct {
-	CacheKey       string
-	TTLSeconds     int
-	RuleName       string
-	SkipRetry      bool
-	ParamTemplate  map[string]any
-	KeySourceType  string
-	KeySourceKey   string
-	KeySourcePath  string
-	KeyHint        string
-	KeyFingerprint string
-	UsingGroup     string
-	ModelName      string
-	RequestPath    string
+	CacheKey               string
+	TTLSeconds             int
+	RuleName               string
+	SkipRetry              bool
+	ParamTemplate          map[string]any
+	KeySourceType          string
+	KeySourceKey           string
+	KeySourcePath          string
+	KeyHint                string
+	KeyFingerprint         string
+	UsingGroup             string
+	ModelName              string
+	RequestPath            string
+	RetryBackoffSeconds    int
+	RetryBackoffCapSeconds int
+	RetryBackoffDisabled   bool
 }
 
 type ChannelAffinityStatsContext struct {
@@ -596,19 +599,22 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 		state.SessionMode, state.SessionModeSource = EffectiveSessionMode(setting, rule)
 		state.RuleName = rule.Name
 		setChannelAffinityContext(c, channelAffinityMeta{
-			CacheKey:       cacheKeyFull,
-			TTLSeconds:     ttlSeconds,
-			RuleName:       rule.Name,
-			SkipRetry:      state.SessionMode == "strict",
-			ParamTemplate:  cloneStringAnyMap(rule.ParamOverrideTemplate),
-			KeySourceType:  strings.TrimSpace(usedSource.Type),
-			KeySourceKey:   strings.TrimSpace(usedSource.Key),
-			KeySourcePath:  strings.TrimSpace(usedSource.Path),
-			KeyHint:        buildChannelAffinityKeyHint(affinityValue),
-			KeyFingerprint: affinityFingerprint(affinityValue),
-			UsingGroup:     usingGroup,
-			ModelName:      modelName,
-			RequestPath:    path,
+			CacheKey:               cacheKeyFull,
+			TTLSeconds:             ttlSeconds,
+			RuleName:               rule.Name,
+			SkipRetry:              state.SessionMode == "strict",
+			ParamTemplate:          cloneStringAnyMap(rule.ParamOverrideTemplate),
+			KeySourceType:          strings.TrimSpace(usedSource.Type),
+			KeySourceKey:           strings.TrimSpace(usedSource.Key),
+			KeySourcePath:          strings.TrimSpace(usedSource.Path),
+			KeyHint:                buildChannelAffinityKeyHint(affinityValue),
+			KeyFingerprint:         affinityFingerprint(affinityValue),
+			UsingGroup:             usingGroup,
+			ModelName:              modelName,
+			RequestPath:            path,
+			RetryBackoffSeconds:    rule.RetryBackoffSeconds,
+			RetryBackoffCapSeconds: rule.RetryBackoffCapSeconds,
+			RetryBackoffDisabled:   rule.RetryBackoffDisabled,
 		})
 
 		state.AddEvent(PolicyEvent{Decision: PolicyDecision{Action: "match", Reason: "session_rule_matched", Source: "session_rule"}})

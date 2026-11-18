@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -645,6 +646,169 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
+}
+
+func TestStreamScannerHandler_SSEKeepaliveDoesNotExtendFirstValidDeadline(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := io.WriteString(pw, ": keepalive\n\nevent: ping\n\ndata:\n\n"); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+	started := time.Now()
+	var got []string
+	StreamScannerHandler(c, &http.Response{Body: pr}, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+	elapsed := time.Since(started)
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	assert.Zero(t, info.ReceivedResponseCount)
+	assert.Empty(t, got)
+	assert.Less(t, elapsed, 2500*time.Millisecond)
+	assert.True(t, service.RelayStreamStarted(c))
+	_, err := io.WriteString(pw, ": after close\n")
+	assert.Error(t, err)
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive writer did not exit after the upstream body closed")
+	}
+}
+
+func TestStreamScannerHandler_KeepaliveAfterPayloadDoesNotExtendIdleDeadline(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+	go func() {
+		defer pw.Close()
+		if _, err := io.WriteString(pw, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"step\"}]}}]}\n"); err != nil {
+			return
+		}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := io.WriteString(pw, ": keepalive\n"); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+	started := time.Now()
+	var got []string
+	StreamScannerHandler(c, &http.Response{Body: pr}, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	assert.Equal(t, 1, info.ReceivedResponseCount)
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], `"thought":true`)
+	assert.Less(t, time.Since(started), 2500*time.Millisecond)
+}
+
+func TestStreamScannerHandler_ThoughtAndUsageDataAreProgress(t *testing.T) {
+	body := ": comment\n\nevent: ping\ndata:\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"step\"}]}}]}\n" +
+		"data: {\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1,\"totalTokenCount\":4}}\n" +
+		"data: [DONE]\n"
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+	info.DisablePing = true
+	var got []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, 2, info.ReceivedResponseCount)
+	require.Len(t, got, 2)
+	assert.Contains(t, got[0], `"thought":true`)
+	assert.Contains(t, got[1], `"usageMetadata"`)
+}
+
+func TestStreamScannerHandler_ClientCancelDuringKeepaliveReturns(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	})
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := io.WriteString(pw, ": keepalive\n"); err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	info := &relaycommon.RelayInfo{DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+	done := make(chan struct{})
+	go func() {
+		StreamScannerHandler(c, &http.Response{Body: pr}, info, func(data string, sr *StreamResult) {})
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the client cancelled during SSE keepalives")
+	}
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	assert.Zero(t, info.ReceivedResponseCount)
 }
 
 func TestNewStreamScannerCallerLimit(t *testing.T) {

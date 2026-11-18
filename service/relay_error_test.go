@@ -1,11 +1,13 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
@@ -218,6 +221,9 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 			RequestPolicy(c).SessionModeSource = "global"
 		}, want: PolicyDecision{Action: "stop", Reason: "strict_session", Source: "global"}},
 		{name: "nil error", retries: 1, want: PolicyDecision{Action: "stop", Reason: "request_completed", Source: "system"}},
+		{name: "upstream stream already relayed", err: upstream(http.StatusInternalServerError), retries: 1, setup: func(c *gin.Context) {
+			MarkRelayStreamStarted(c)
+		}, want: PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -229,6 +235,167 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 			assert.Equal(t, tc.want.Action == "retry", ShouldRetryRelayError(c, tc.err, tc.retries))
 		})
 	}
+}
+
+func TestRelayRetryDelayStaysInsideGemini429Scope(t *testing.T) {
+	previousInitial, previousCap := geminiRetryBackoffInitial, geminiRetryBackoffCap
+	geminiRetryBackoffInitial = 2 * time.Second
+	geminiRetryBackoffCap = 30 * time.Second
+	t.Cleanup(func() {
+		geminiRetryBackoffInitial = previousInitial
+		geminiRetryBackoffCap = previousCap
+	})
+	newContext := func() *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		return c
+	}
+	withRetryAfter := func(delay time.Duration, present bool) *types.NewAPIError {
+		apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+		if present {
+			apiErr.SetRetryAfter(delay)
+		}
+		return apiErr
+	}
+	c := newContext()
+	assert.Equal(t, 2*time.Second, RelayRetryDelay(c, constant.ChannelTypeGemini, withRetryAfter(0, false)))
+	assert.Equal(t, 2*time.Second, RelayRetryDelay(c, constant.ChannelTypeVertexAi, withRetryAfter(0, false)))
+	assert.Equal(t, time.Duration(0), RelayRetryDelay(c, constant.ChannelTypeOpenAI, withRetryAfter(9*time.Second, true)))
+	assert.Equal(t, time.Duration(0), RelayRetryDelay(c, constant.ChannelTypeGemini, types.NewOpenAIError(errors.New("upstream"), types.ErrorCodeBadResponseStatusCode, http.StatusInternalServerError)))
+	assert.Equal(t, time.Second, RelayRetryDelay(c, constant.ChannelTypeVertexAi, withRetryAfter(time.Second, true)))
+	assert.Equal(t, time.Duration(0), RelayRetryDelay(c, constant.ChannelTypeGemini, withRetryAfter(0, true)))
+	assert.Equal(t, 30*time.Second, RelayRetryDelay(c, constant.ChannelTypeGemini, withRetryAfter(2*time.Minute, true)))
+
+	configured := newContext()
+	setChannelAffinityContext(configured, channelAffinityMeta{RetryBackoffSeconds: 5, RetryBackoffCapSeconds: 10})
+	assert.Equal(t, 5*time.Second, RelayRetryDelay(configured, constant.ChannelTypeOpenAI, withRetryAfter(0, false)))
+	assert.Equal(t, 10*time.Second, RelayRetryDelay(configured, constant.ChannelTypeGemini, withRetryAfter(50*time.Second, true)))
+	disabled := newContext()
+	setChannelAffinityContext(disabled, channelAffinityMeta{RetryBackoffDisabled: true})
+	assert.Equal(t, time.Duration(0), RelayRetryDelay(disabled, constant.ChannelTypeVertexAi, withRetryAfter(2*time.Minute, true)))
+
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"4"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"RESOURCE_EXHAUSTED","type":"rate_limit"}}`)),
+	}
+	parsed := RelayErrorHandler(context.Background(), resp, false)
+	delay, ok := parsed.RetryAfter()
+	require.True(t, ok)
+	assert.Equal(t, 4*time.Second, delay)
+	assert.Equal(t, 4*time.Second, RelayRetryDelay(c, constant.ChannelTypeGemini, parsed))
+	assert.Equal(t, time.Duration(0), RelayRetryDelay(c, constant.ChannelTypeOpenAI, parsed))
+
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	dateDelay, dateOK := parseRetryAfter(now.Add(5*time.Second).UTC().Format(http.TimeFormat), now)
+	require.True(t, dateOK)
+	assert.Equal(t, 5*time.Second, dateDelay)
+	pastDelay, pastOK := parseRetryAfter(now.Add(-5*time.Second).UTC().Format(http.TimeFormat), now)
+	require.True(t, pastOK)
+	assert.Equal(t, time.Duration(0), pastDelay)
+	_, badOK := parseRetryAfter("soon", now)
+	assert.False(t, badOK)
+}
+
+func TestGemini429WaitsOnceThenAllowsOneFallback(t *testing.T) {
+	previousInitial, previousCap := geminiRetryBackoffInitial, geminiRetryBackoffCap
+	geminiRetryBackoffInitial = 40 * time.Millisecond
+	geminiRetryBackoffCap = 30 * time.Second
+	t.Cleanup(func() {
+		geminiRetryBackoffInitial = previousInitial
+		geminiRetryBackoffCap = previousCap
+	})
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+	const retryTimes = 1
+	attempts := 0
+	waits := 0
+	for retry := 0; retry <= retryTimes; retry++ {
+		attempts++
+		decision := DecideRelayRetry(c, apiErr, retryTimes-retry)
+		waited, err := WaitBeforeRelayRetry(c, constant.ChannelTypeVertexAi, apiErr, decision)
+		require.NoError(t, err)
+		if waited > 0 {
+			waits++
+		}
+		if decision.Action != "retry" {
+			assert.Equal(t, time.Duration(0), waited)
+			break
+		}
+	}
+	assert.Equal(t, 2, attempts, "RetryTimes=1 is the original attempt plus one fallback")
+	assert.Equal(t, 1, waits)
+}
+
+func TestSkipRetryAndCancellationDoNotSleepThroughBackoff(t *testing.T) {
+	previousInitial := geminiRetryBackoffInitial
+	geminiRetryBackoffInitial = 5 * time.Second
+	t.Cleanup(func() { geminiRetryBackoffInitial = previousInitial })
+	apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+
+	skipped, _ := gin.CreateTestContext(httptest.NewRecorder())
+	skipped.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	skipped.Set(ginKeyChannelAffinitySkipRetry, true)
+	RequestPolicy(skipped).SessionModeSource = "session_rule"
+	decision := DecideRelayRetry(skipped, apiErr, 1)
+	require.Equal(t, "stop", decision.Action)
+	started := time.Now()
+	waited, err := WaitBeforeRelayRetry(skipped, constant.ChannelTypeGemini, apiErr, decision)
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), waited)
+	assert.Less(t, time.Since(started), 200*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelled, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cancelled.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	started = time.Now()
+	waited, err = WaitBeforeRelayRetry(cancelled, constant.ChannelTypeGemini, apiErr, PolicyDecision{Action: "retry", Reason: "retry_status_matched", Source: "global"})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 5*time.Second, waited)
+	assert.Less(t, time.Since(started), time.Second)
+
+	recorder := httptest.NewRecorder()
+	keepalive, _ := gin.CreateTestContext(recorder)
+	keepalive.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	_, writeErr := keepalive.Writer.Write([]byte(": PING\n\n"))
+	require.NoError(t, writeErr)
+	require.True(t, keepalive.Writer.Written())
+	assert.Equal(t, "retry", DecideRelayRetry(keepalive, apiErr, 1).Action, "a pre-request keepalive does not commit the upstream stream")
+	openAIWait, waitErr := WaitBeforeRelayRetry(keepalive, constant.ChannelTypeOpenAI, apiErr, PolicyDecision{Action: "retry"})
+	require.NoError(t, waitErr)
+	assert.Equal(t, time.Duration(0), openAIWait)
+}
+
+func TestMatchedAffinityRuleCarriesRetryBackoff(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	previous := *setting
+	t.Cleanup(func() { *setting = previous })
+	setting.Enabled = true
+	setting.Rules = []operation_setting.ChannelAffinityRule{{
+		Name:                   "gemini argon",
+		ModelRegex:             []string{"^gemini-4-argon$"},
+		KeySources:             []operation_setting.ChannelAffinityKeySource{{Type: "request_header", Key: "X-Session"}},
+		RetryBackoffSeconds:    5,
+		RetryBackoffCapSeconds: 10,
+	}}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Request.Header.Set("X-Session", "session-a")
+	_, _ = GetPreferredChannelByAffinity(c, "gemini-4-argon", "default")
+	*setting = previous
+	meta, ok := getChannelAffinityMeta(c)
+	require.True(t, ok)
+	assert.Equal(t, 5, meta.RetryBackoffSeconds)
+	assert.Equal(t, 10, meta.RetryBackoffCapSeconds)
+	assert.False(t, meta.RetryBackoffDisabled)
+	apiErr := types.NewOpenAIError(errors.New("RESOURCE_EXHAUSTED"), types.ErrorCodeBadResponseStatusCode, http.StatusTooManyRequests)
+	apiErr.SetRetryAfter(50 * time.Second)
+	assert.Equal(t, 10*time.Second, RelayRetryDelay(c, constant.ChannelTypeOpenAI, apiErr))
 }
 
 func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {

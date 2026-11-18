@@ -25,6 +25,20 @@ type ChannelAffinityRule struct {
 	// Empty preserves the legacy SkipRetryOnFailure behavior.
 	SessionMode string `json:"session_mode,omitempty"`
 
+	// RetryBackoffSeconds waits before the next attempt after a retryable 429
+	// on a request this rule matched. Zero keeps the provider default: Gemini
+	// and Vertex wait, and every other channel does not. It does not change
+	// whether a retry happens or how many attempts are allowed.
+	RetryBackoffSeconds int `json:"retry_backoff_seconds,omitempty"`
+	// RetryBackoffCapSeconds bounds that wait and any Retry-After header.
+	// Zero uses the provider cap. The value cannot raise the wait above the
+	// built-in safety cap.
+	RetryBackoffCapSeconds int `json:"retry_backoff_cap_seconds,omitempty"`
+	// RetryBackoffDisabled turns the wait off for this rule, including the
+	// Gemini and Vertex default. SkipRetryOnFailure still decides whether the
+	// retry itself is allowed.
+	RetryBackoffDisabled bool `json:"retry_backoff_disabled,omitempty"`
+
 	IncludeUsingGroup bool `json:"include_using_group"`
 	IncludeModelName  bool `json:"include_model_name"`
 	IncludeRuleName   bool `json:"include_rule_name"`

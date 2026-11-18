@@ -707,6 +707,7 @@
   "reserve adjusted task billing error: %s": "按调整后的任务费用补扣预扣费失败: %s",
   "responses stream failed after output was delivered, billing the delivered output: %s": "Responses 流中途失败，已输出的内容照常计费: %s",
   "responses websocket relay error: %s": "Responses WebSocket 转发出错: %s",
+  "retry backoff before fallback: channel_type=%d status=%d wait=%s": "重试退避后再切换渠道: channel_type=%d status=%d wait=%s",
   "retry: %s": "重试：%s",
   "running in debug mode": "调试模式已开启",
   "saved dashboard data, %d records": "保存数据看板数据成功，共保存%d条数据",

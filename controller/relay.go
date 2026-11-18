@@ -230,6 +230,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if decision.Action != "retry" {
 			break
 		}
+		if _, waitErr := service.WaitBeforeRelayRetry(c, channel.Type, newAPIError, decision); waitErr != nil {
+			break
+		}
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
