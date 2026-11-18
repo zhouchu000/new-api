@@ -279,6 +279,66 @@ func TestOtherStatusesPassThroughAndRedirectIsNotFollowed(t *testing.T) {
 	assert.Equal(t, int32(0), evilHits.Load())
 }
 
+func TestSSEPreservesCRLFAndContentEncoding(t *testing.T) {
+	const payload = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"step\"}]}}]}\r\n\r\ndata: {\"usageMetadata\":{\"totalTokenCount\":4}}\r\n\r\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "identity")
+		w.Header().Set("Content-Length", "9999")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, payload)
+	}))
+	t.Cleanup(upstream.Close)
+	helper := httptest.NewServer(NewHandler(Config{
+		Upstream: upstream.URL, Delay: time.Second, DelayCap: time.Second,
+		FirstValid: time.Second, Idle: time.Second,
+	}))
+	t.Cleanup(helper.Close)
+
+	resp, err := http.Get(helper.URL + "/v1/projects/p/locations/global/publishers/google/models/gemini-4-argon:streamGenerateContent?alt=sse")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, payload, string(got))
+	assert.Equal(t, "identity", resp.Header.Get("Content-Encoding"))
+	assert.Empty(t, resp.Header.Get("Content-Length"))
+	assert.Contains(t, string(got), "\r\n")
+}
+
+func TestAbsoluteFormIsNotAForwardProxy(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	handler := NewHandler(Config{Upstream: upstream.URL, Delay: time.Millisecond, DelayCap: time.Second, FirstValid: time.Second, Idle: time.Second})
+	req := httptest.NewRequest(http.MethodGet, "http://evil.example/steal", nil)
+	req.RequestURI = "http://evil.example/steal"
+	req.URL.Host = "evil.example"
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Equal(t, int32(0), hits.Load())
+}
+
+func TestListenDefaultsToLoopback(t *testing.T) {
+	require.NoError(t, validateListen(defaultListenAddr))
+	assert.Equal(t, "127.0.0.1:30610", defaultListenAddr)
+	assert.Error(t, validateListen("0.0.0.0:30610"))
+	assert.Error(t, validateListen(":30610"))
+	assert.Error(t, validateListen("127.0.0.1:30591"))
+	assert.Error(t, validateListen("127.0.0.1:30595"))
+	require.NoError(t, validateUpstream("https://aiplatform.googleapis.com"))
+	assert.Error(t, validateUpstream("https://user:pass@aiplatform.googleapis.com"))
+	assert.Error(t, validateUpstream("https://aiplatform.googleapis.com/v1"))
+	var buf bytes.Buffer
+	assert.Equal(t, 0, run([]string{"-version"}, &buf))
+	assert.Contains(t, buf.String(), "gemini-egress-helper "+helperVersion)
+}
+
 func TestDialFailureHidesHostAndCredentials(t *testing.T) {
 	logs := &bytes.Buffer{}
 	helper := httptest.NewServer(NewHandler(Config{

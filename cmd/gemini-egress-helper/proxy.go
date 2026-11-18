@@ -19,22 +19,25 @@ import (
 )
 
 const (
-	defaultDelay     = 2 * time.Second
-	defaultDelayCap  = 30 * time.Second
-	defaultFirstWait = 300 * time.Second
-	defaultIdle      = 300 * time.Second
-	maxErrorBody     = 1 << 20
+	defaultDelay         = 2 * time.Second
+	defaultDelayCap      = 30 * time.Second
+	defaultFirstWait     = 300 * time.Second
+	defaultIdle          = 300 * time.Second
+	defaultHeaderTimeout = 2 * time.Minute
+	maxErrorBody         = 1 << 20
+	maxRequestTarget     = 8 << 10
 )
 
 // Config is the helper's behavior. Zero durations use the defaults above.
 // Upstream is the only origin requests are forwarded to.
 type Config struct {
-	Upstream   string
-	Delay      time.Duration
-	DelayCap   time.Duration
-	FirstValid time.Duration
-	Idle       time.Duration
-	Logf       func(string, ...any)
+	Upstream      string
+	Delay         time.Duration
+	DelayCap      time.Duration
+	FirstValid    time.Duration
+	Idle          time.Duration
+	HeaderTimeout time.Duration
+	Logf          func(string, ...any)
 }
 
 type handler struct {
@@ -59,6 +62,9 @@ func NewHandler(cfg Config) http.Handler {
 	if cfg.Idle <= 0 {
 		cfg.Idle = defaultIdle
 	}
+	if cfg.HeaderTimeout <= 0 {
+		cfg.HeaderTimeout = defaultHeaderTimeout
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
@@ -71,7 +77,7 @@ func NewHandler(cfg Config) http.Handler {
 			Transport: &http.Transport{
 				Proxy:                 nil,
 				DisableCompression:    true,
-				ResponseHeaderTimeout: 2 * time.Minute,
+				ResponseHeaderTimeout: cfg.HeaderTimeout,
 				IdleConnTimeout:       90 * time.Second,
 			},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -82,7 +88,12 @@ func NewHandler(cfg Config) http.Handler {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	upstreamURL := strings.TrimRight(h.cfg.Upstream, "/") + r.URL.RequestURI()
+	target, ok := originRequestTarget(r)
+	if !ok {
+		http.Error(w, "invalid request target", http.StatusBadRequest)
+		return
+	}
+	upstreamURL := strings.TrimRight(h.cfg.Upstream, "/") + target
 	out, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
 	if err != nil {
 		h.cfg.Logf("reject request")
@@ -110,6 +121,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(w.Header(), resp.Header)
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		// The body is copied unchanged, including CRLF, but a deadline may
+		// close it early. A Content-Length copied from upstream would promise
+		// bytes that will not be sent.
+		w.Header().Del("Content-Length")
+	}
 	w.WriteHeader(resp.StatusCode)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -141,6 +158,22 @@ func (h *handler) finishTooMany(w http.ResponseWriter, r *http.Request, resp *ht
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusTooManyRequests)
 	_, _ = w.Write(body)
+}
+
+// originRequestTarget accepts only an origin-form path on this process's
+// fixed upstream. An absolute-form request would be a forward proxy.
+func originRequestTarget(r *http.Request) (string, bool) {
+	if r == nil || r.URL == nil || r.URL.IsAbs() || r.URL.Host != "" {
+		return "", false
+	}
+	target := r.URL.RequestURI()
+	if len(target) == 0 || len(target) > maxRequestTarget {
+		return "", false
+	}
+	if !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+		return "", false
+	}
+	return target, true
 }
 
 func writeFailure(w http.ResponseWriter) {
